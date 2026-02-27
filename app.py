@@ -10,9 +10,9 @@ from openai import OpenAI
 # =========================
 # 0) 基础配置
 # =========================
-# 云端部署用 st.secrets；本地仍可用 .env 兜底
 load_dotenv()
 
+# 云端部署用 st.secrets；本地用 .env 兜底
 ARK_API_KEY = st.secrets.get("ARK_API_KEY") or os.getenv("ARK_API_KEY")
 ARK_BASE_URL = st.secrets.get("ARK_BASE_URL") or os.getenv("ARK_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
 MODEL_NAME = st.secrets.get("ARK_MODEL") or os.getenv("ARK_MODEL")
@@ -110,14 +110,13 @@ def parse_json_safely(text: str):
     return None
 
 # =========================
-# 4) UI + 样式（C + 修复侧边栏可读性 + 翻牌动画）
+# 4) UI + 样式（深色氛围 + 动画）
 # =========================
 st.set_page_config(page_title="塔罗占卜", page_icon="🔮")
 
 st.markdown(
     """
 <style>
-/* 背景星云渐变 */
 .stApp {
   background:
     radial-gradient(900px 600px at 10% 10%, rgba(140, 82, 255, 0.22), transparent 60%),
@@ -126,34 +125,24 @@ st.markdown(
     linear-gradient(180deg, #0b0b14 0%, #080812 40%, #050510 100%);
   color: rgba(255,255,255,0.92);
 }
-
-.block-container { padding-top: 1.8rem; max-width: 1020px; }
-
+.block-container { padding-top: 1.6rem; max-width: 1020px; }
 h1, h2, h3 { letter-spacing: 0.5px; }
 
-/* ✅ 侧边栏：更亮更清晰 */
 section[data-testid="stSidebar"] {
   background: linear-gradient(180deg, rgba(255,255,255,0.07), rgba(255,255,255,0.03));
   border-right: 1px solid rgba(255,255,255,0.10);
 }
-section[data-testid="stSidebar"] * {
-  color: rgba(255,255,255,0.92) !important;
-}
+section[data-testid="stSidebar"] * { color: rgba(255,255,255,0.92) !important; }
 section[data-testid="stSidebar"] label,
 section[data-testid="stSidebar"] p,
-section[data-testid="stSidebar"] span {
-  opacity: 1 !important;
-  font-weight: 600 !important;
-}
+section[data-testid="stSidebar"] span { opacity: 1 !important; font-weight: 600 !important; }
 
-/* 输入框 / 下拉更暗色 */
 div[data-baseweb="input"] > div,
 div[data-baseweb="select"] > div {
   background: rgba(255,255,255,0.06) !important;
   border: 1px solid rgba(255,255,255,0.16) !important;
 }
 
-/* 按钮：紫色微光 */
 .stButton > button {
   border-radius: 12px !important;
   border: 1px solid rgba(255,255,255,0.16) !important;
@@ -166,20 +155,17 @@ div[data-baseweb="select"] > div {
   box-shadow: 0 16px 42px rgba(0,0,0,0.35), 0 0 18px rgba(140,82,255,0.22);
 }
 
-/* 进度条 */
 div[data-testid="stProgressBar"] > div > div {
   background: linear-gradient(90deg, rgba(140,82,255,0.95), rgba(0,255,210,0.70)) !important;
 }
 
-/* 卡片：玻璃拟态 */
 .tarot-card {
   border: 1px solid rgba(255,255,255,0.16);
   border-radius: 18px;
   padding: 14px 14px 10px 14px;
   background: rgba(255,255,255,0.04);
-  box-shadow:
-    0 16px 45px rgba(0,0,0,0.30),
-    0 0 0 1px rgba(180,120,255,0.06) inset;
+  box-shadow: 0 16px 45px rgba(0,0,0,0.30),
+              0 0 0 1px rgba(180,120,255,0.06) inset;
   backdrop-filter: blur(8px);
 }
 .tarot-title { font-weight: 800; font-size: 1.05rem; margin-bottom: 6px; }
@@ -194,25 +180,18 @@ div[data-testid="stProgressBar"] > div > div {
 }
 .small { font-size: 0.88rem; opacity: 0.88; }
 
-/* ✅ 翻牌动画：翻开时做一次翻转 + 淡入 */
 @keyframes flipIn {
   0%   { transform: perspective(900px) rotateY(70deg) translateY(10px); opacity: 0; }
   60%  { transform: perspective(900px) rotateY(-10deg) translateY(0px); opacity: 1; }
   100% { transform: perspective(900px) rotateY(0deg) translateY(0px); opacity: 1; }
 }
-.revealed-anim {
-  animation: flipIn 650ms ease;
-  transform-origin: center;
-}
+.revealed-anim { animation: flipIn 650ms ease; transform-origin: center; }
 
-/* 牌背也做个轻微淡入 */
 @keyframes fadeIn {
   from { opacity: 0.25; transform: translateY(4px); }
   to   { opacity: 1; transform: translateY(0); }
 }
-.back-anim {
-  animation: fadeIn 450ms ease;
-}
+.back-anim { animation: fadeIn 450ms ease; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -222,21 +201,24 @@ div[data-testid="stProgressBar"] > div > div {
 # 5) 页面内容
 # =========================
 st.title("🔮 塔罗占卜（沉浸版）")
-st.caption("A：洗牌/翻牌节奏 + 牌背图 ｜ B：横向牌桌布局 ｜ C：深色氛围主题 + 翻牌动画")
 
-# ---- 侧边栏 ----
-st.sidebar.header("🧭 占卜设置")
-topic = st.sidebar.selectbox("问题类型", ["综合", "恋爱", "事业", "学业", "自我成长"])
-spread = st.sidebar.selectbox("牌阵", ["单牌（今日指引）", "圣三角（三牌：过去-现在-未来）"])
-tone = st.sidebar.selectbox("解读风格", ["温和", "直接", "治愈"])
-show_base_meaning = st.sidebar.checkbox("显示基础牌义", value=True)
+# ✅ 手机引导提示（非常有效）
+st.info("📱 手机用户：左上角有一个小箭头/菜单可以打开设置侧边栏；也可以直接用下面的「快速设置」。")
 
-st.sidebar.divider()
-shuffle_seconds = st.sidebar.slider("洗牌时长（秒）", 0, 5, 2)
-flip_seconds = st.sidebar.slider("翻牌停顿（秒）", 0, 3, 1)
-compact_mode = st.sidebar.checkbox("紧凑布局（更像卡片墙）", value=True)
+# ---- 会话状态初始化：把设置也放 session_state，保证同步 ----
+DEFAULTS = {
+    "topic": "综合",
+    "spread": "圣三角（三牌：过去-现在-未来）",
+    "tone": "温和",
+    "show_base_meaning": True,
+    "shuffle_seconds": 2,
+    "flip_seconds": 1,
+    "compact_mode": True,
+}
+for k, v in DEFAULTS.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-# ---- 状态 ----
 if "history" not in st.session_state:
     st.session_state["history"] = []
 if "current_draw" not in st.session_state:
@@ -245,6 +227,69 @@ if "reveal_index" not in st.session_state:
     st.session_state["reveal_index"] = 0
 if "temp_reading" not in st.session_state:
     st.session_state["temp_reading"] = None
+
+# ---- 侧边栏设置（会写入 session_state） ----
+st.sidebar.header("🧭 占卜设置（侧边栏）")
+st.session_state["topic"] = st.sidebar.selectbox(
+    "问题类型",
+    ["综合", "恋爱", "事业", "学业", "自我成长"],
+    index=["综合", "恋爱", "事业", "学业", "自我成长"].index(st.session_state["topic"]),
+)
+st.session_state["spread"] = st.sidebar.selectbox(
+    "牌阵",
+    ["单牌（今日指引）", "圣三角（三牌：过去-现在-未来）"],
+    index=["单牌（今日指引）", "圣三角（三牌：过去-现在-未来）"].index(st.session_state["spread"]),
+)
+st.session_state["tone"] = st.sidebar.selectbox(
+    "解读风格",
+    ["温和", "直接", "治愈"],
+    index=["温和", "直接", "治愈"].index(st.session_state["tone"]),
+)
+st.session_state["show_base_meaning"] = st.sidebar.checkbox("显示基础牌义", value=st.session_state["show_base_meaning"])
+
+st.sidebar.divider()
+st.session_state["shuffle_seconds"] = st.sidebar.slider("洗牌时长（秒）", 0, 5, st.session_state["shuffle_seconds"])
+st.session_state["flip_seconds"] = st.sidebar.slider("翻牌停顿（秒）", 0, 3, st.session_state["flip_seconds"])
+st.session_state["compact_mode"] = st.sidebar.checkbox("紧凑布局（更像卡片墙）", value=st.session_state["compact_mode"])
+
+# ---- ✅ 主页面“快速设置”（手机友好） ----
+with st.expander("⚙️ 快速设置（手机友好：这里也能选牌阵/风格）", expanded=True):
+    c1, c2 = st.columns(2)
+    with c1:
+        st.session_state["topic"] = st.selectbox(
+            "问题类型（快速）",
+            ["综合", "恋爱", "事业", "学业", "自我成长"],
+            index=["综合", "恋爱", "事业", "学业", "自我成长"].index(st.session_state["topic"]),
+            key="topic_main",
+        )
+        st.session_state["tone"] = st.selectbox(
+            "解读风格（快速）",
+            ["温和", "直接", "治愈"],
+            index=["温和", "直接", "治愈"].index(st.session_state["tone"]),
+            key="tone_main",
+        )
+    with c2:
+        st.session_state["spread"] = st.selectbox(
+            "牌阵（快速）",
+            ["单牌（今日指引）", "圣三角（三牌：过去-现在-未来）"],
+            index=["单牌（今日指引）", "圣三角（三牌：过去-现在-未来）"].index(st.session_state["spread"]),
+            key="spread_main",
+        )
+        st.session_state["show_base_meaning"] = st.checkbox(
+            "显示基础牌义（快速）",
+            value=st.session_state["show_base_meaning"],
+            key="base_meaning_main",
+        )
+
+    st.session_state["shuffle_seconds"] = st.slider(
+        "洗牌时长（秒）（快速）", 0, 5, st.session_state["shuffle_seconds"], key="shuffle_main"
+    )
+    st.session_state["flip_seconds"] = st.slider(
+        "翻牌停顿（秒）（快速）", 0, 3, st.session_state["flip_seconds"], key="flip_main"
+    )
+    st.session_state["compact_mode"] = st.checkbox(
+        "紧凑布局（快速）", value=st.session_state["compact_mode"], key="compact_main"
+    )
 
 # ---- 仪式提示 ----
 st.markdown("### 🌙 小小仪式")
@@ -263,17 +308,18 @@ with col_start:
         if not question.strip():
             st.warning("先写下你的问题～")
         else:
-            # 洗牌：更明显的“动画反馈”（进度条 + spinner）
-            if shuffle_seconds > 0:
+            # 洗牌进度条更明显
+            s = st.session_state["shuffle_seconds"]
+            if s > 0:
                 p = st.progress(0.0)
                 with st.spinner("正在洗牌..."):
-                    steps = max(1, shuffle_seconds * 10)
+                    steps = max(1, s * 10)
                     for i in range(steps):
-                        time.sleep(shuffle_seconds / steps)
+                        time.sleep(s / steps)
                         p.progress((i + 1) / steps)
                 p.empty()
 
-            st.session_state["current_draw"] = draw_spread(spread)
+            st.session_state["current_draw"] = draw_spread(st.session_state["spread"])
             st.session_state["reveal_index"] = 0
             st.session_state["temp_reading"] = None
 
@@ -282,10 +328,10 @@ with col_next:
         if not st.session_state["current_draw"]:
             st.info("请先点击“开始抽牌”")
         else:
-            # 翻牌：短暂停顿（让用户感到“翻开的瞬间”）
-            if flip_seconds > 0:
+            fs = st.session_state["flip_seconds"]
+            if fs > 0:
                 with st.spinner("翻牌中..."):
-                    time.sleep(flip_seconds)
+                    time.sleep(fs)
 
             idx = st.session_state["reveal_index"]
             last = len(st.session_state["current_draw"]) - 1
@@ -300,7 +346,7 @@ with col_reset:
         st.session_state["reveal_index"] = 0
         st.session_state["temp_reading"] = None
 
-# ---- 牌桌（横向） ----
+# ---- 牌桌 ----
 st.subheader("🃏 你抽到的牌（逐张翻开）")
 
 def render_card_back():
@@ -316,12 +362,11 @@ if st.session_state["current_draw"]:
     total = len(cards_all)
     st.progress(min(1.0, (reveal_i + 1) / max(1, total)))
 
-    cols = st.columns(total, gap="small" if compact_mode else "large")
+    cols = st.columns(total, gap="small" if st.session_state["compact_mode"] else "large")
 
     for i, c in enumerate(cards_all):
         with cols[i]:
             if i <= reveal_i:
-                # ✅ 给“已翻开卡片”加 revealed-anim 动画类
                 card_html = f"""
 <div class="tarot-card revealed-anim">
   <div class="tarot-title">
@@ -332,7 +377,7 @@ if st.session_state["current_draw"]:
 </div>
 """
                 st.markdown(card_html, unsafe_allow_html=True)
-                if show_base_meaning:
+                if st.session_state["show_base_meaning"]:
                     st.caption(f"基础牌义：{c['meaning']}")
             else:
                 card_html = f"""
@@ -346,27 +391,31 @@ if st.session_state["current_draw"]:
                 st.markdown(card_html, unsafe_allow_html=True)
                 render_card_back()
 
-    # 翻完后调用 AI
+    # 翻完后调用 AI（只调用一次）
     if reveal_i >= len(cards_all) - 1 and st.session_state["temp_reading"] is None:
         with st.spinner("正在为你组合解读，请稍等..."):
             try:
-                reading_text = ai_reading(question, spread, cards_all, topic, tone)
+                reading_text = ai_reading(
+                    question,
+                    st.session_state["spread"],
+                    cards_all,
+                    st.session_state["topic"],
+                    st.session_state["tone"],
+                )
                 data = parse_json_safely(reading_text)
             except Exception as e:
                 data = None
                 reading_text = f"解读失败：{e}"
 
             if not data:
-                st.session_state["temp_reading"] = {
-                    "raw": "（解析JSON失败，显示原始内容）\n\n" + (reading_text or "无返回")
-                }
+                st.session_state["temp_reading"] = {"raw": "（解析JSON失败，显示原始内容）\n\n" + (reading_text or "无返回")}
             else:
                 st.session_state["temp_reading"] = data
                 st.session_state["history"].insert(0, {
                     "question": question,
-                    "topic": topic,
-                    "tone": tone,
-                    "spread": spread,
+                    "topic": st.session_state["topic"],
+                    "tone": st.session_state["tone"],
+                    "spread": st.session_state["spread"],
                     "cards": cards_all,
                     "reading": data
                 })
@@ -421,11 +470,11 @@ if st.session_state["history"]:
     for idx, h in enumerate(st.session_state["history"][:10], start=1):
         st.markdown(f"### 记录 {idx}")
         st.markdown(f"**问题：** {h['question']}")
-        st.markdown(
-            f"**类型：** {h.get('topic','综合')} | **风格：** {h.get('tone','温和')} | **牌阵：** {h.get('spread')}"
-        )
+        st.markdown(f"**类型：** {h.get('topic','综合')} | **风格：** {h.get('tone','温和')} | **牌阵：** {h.get('spread')}")
+
         for c in h["cards"]:
             st.markdown(f"- {c.get('pos_label','')} {c['name']}（{c['position']}）：{c['meaning']}")
+
         with st.expander("查看解读"):
             r = h["reading"]
             if isinstance(r, dict):
