@@ -10,13 +10,14 @@ from openai import OpenAI
 # =========================
 # 0) 基础配置
 # =========================
+# 云端部署用 st.secrets；本地仍可用 .env 兜底
 load_dotenv()
 
-client = OpenAI(
-    api_key=os.getenv("ARK_API_KEY"),
-    base_url=os.getenv("ARK_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3"),
-)
-MODEL_NAME = os.getenv("ARK_MODEL")
+ARK_API_KEY = st.secrets.get("ARK_API_KEY") or os.getenv("ARK_API_KEY")
+ARK_BASE_URL = st.secrets.get("ARK_BASE_URL") or os.getenv("ARK_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
+MODEL_NAME = st.secrets.get("ARK_MODEL") or os.getenv("ARK_MODEL")
+
+client = OpenAI(api_key=ARK_API_KEY, base_url=ARK_BASE_URL)
 
 # =========================
 # 1) 读取牌库 cards.json
