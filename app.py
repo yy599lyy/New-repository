@@ -33,7 +33,6 @@ def load_cards():
 CARDS = load_cards()
 
 def make_card(card_obj):
-    """给一张牌随机正逆位，并生成基础牌义"""
     is_reversed = random.choice([True, False])
     meaning = card_obj["reversed"] if is_reversed else card_obj["upright"]
     return {
@@ -69,48 +68,48 @@ FOLLOW_UP = {
 }
 
 # =========================
-# 3) 解读：更具体 + 引用追问答案
+# 3) AI 解读
 # =========================
 def ai_reading_specific(question: str, drawn_cards: list, topic: str, tone: str, followup_answers: dict) -> str:
     prompt = f"""
 你是一位专业塔罗解读师。风格：{tone}。问题类型：{topic}。
 你必须针对用户的【具体问题】给出【具体、可执行、可验证】的解读。
-用户还回答了两个澄清问题，你必须把这些答案纳入解读逻辑，像真人一样贴近用户处境。
+用户回答了两个澄清问题，你必须纳入解读逻辑，像真人一样贴近用户处境。
 
 请输出【严格JSON】，不要输出任何多余文字、不要markdown、不要代码块。
 
 必须做到：
-1) 从用户问题中提炼 3-6 个关键词，并在输出中明确使用（keywords_used）
-2) 每张牌解读必须包含：影响点（impact）、可观察的迹象/证据（signal）、可执行动作（action）
+1) 从用户问题中提炼 3-6 个关键词（keywords_used），并在输出中明确使用
+2) 每张牌解读必须包含：影响点（impact）、可观察迹象/证据（signal）、可执行动作（action）
 3) 给出 3 条“未来要观察的信号”（signals_to_watch）
-4) 给出 2 条“如果...那么...”的应对策略（if_then_plan）
+4) 给出 2 条“如果...那么...”策略（if_then_plan）
 5) 不做“必然预测”，用“倾向/可能/建议”
-6) 不编造牌面之外的细节（不凭空说具体人物/金额/日期）
+6) 不编造牌面之外细节（不凭空说具体人物/金额/日期）
 7) 不提供医疗/法律/投资具体指令；若涉及，给安全提示与建议寻求专业人士
 
 JSON字段（必须全部包含）：
 - one_line: 一句话结论（<=22字，必须贴题）
 - keywords_used: 数组（3-6个关键词）
-- user_context: 用1-2句复述用户处境（必须引用用户的追问答案）
-- overall: 数组（2句即可，凝练）
-- card_readings: 数组，长度=3；每个元素包含：
+- user_context: 1-2句复述处境（必须引用追问答案）
+- overall: 数组（2句）
+- card_readings: 数组(3个)，每个元素：
     - position: 过去/现在/未来
     - card: 牌名
     - orientation: 正位/逆位
-    - impact: 对该位置与该问题意味着什么（1-2句）
-    - signal: 建议观察的迹象/证据（1-2句，必须可观察）
-    - action: 建议的具体动作（1-2句，必须可执行）
-- advice: 3条可执行建议（数组）
-- signals_to_watch: 3条（数组，必须可观察）
-- if_then_plan: 2条（数组，必须是“如果…那么…”）
-- caution: 1-2条提醒（数组）
+    - impact: 1-2句
+    - signal: 1-2句（可观察）
+    - action: 1-2句（可执行）
+- advice: 3条（数组）
+- signals_to_watch: 3条（数组）
+- if_then_plan: 2条（数组，必须“如果…那么…”）
+- caution: 1-2条（数组）
 
 用户问题：{question}
 
-用户追问答案（必须使用）：
+追问答案（必须使用）：
 {json.dumps(followup_answers, ensure_ascii=False)}
 
-抽到的牌（含基础牌义与位置）：
+抽到的牌（含位置与基础牌义）：
 {json.dumps(drawn_cards, ensure_ascii=False)}
 """
     resp = client.chat.completions.create(
@@ -161,12 +160,6 @@ st.markdown(
 .block-container { padding-top: 1.1rem; max-width: 980px; }
 h1, h2, h3 { letter-spacing: 0.5px; }
 
-section[data-testid="stSidebar"] {
-  background: linear-gradient(180deg, rgba(255,255,255,0.07), rgba(255,255,255,0.03));
-  border-right: 1px solid rgba(255,255,255,0.10);
-}
-section[data-testid="stSidebar"] * { color: rgba(255,255,255,0.92) !important; }
-
 .tarot-card {
   border: 1px solid rgba(255,255,255,0.16);
   border-radius: 18px;
@@ -191,7 +184,7 @@ section[data-testid="stSidebar"] * { color: rgba(255,255,255,0.92) !important; }
   background: linear-gradient(135deg,#2a1b3d,#1a0f2a);
   border: 2px solid rgba(122,95,160,0.6);
   border-radius: 14px;
-  height: 180px;
+  height: 160px;
   display:flex;
   align-items:center;
   justify-content:center;
@@ -199,58 +192,40 @@ section[data-testid="stSidebar"] * { color: rgba(255,255,255,0.92) !important; }
   font-size:2.2rem;
 }
 
-/* 卡牌堆 */
-.stack-wrap {
-  display:flex;
-  justify-content:center;
-  align-items:center;
-  margin: 10px 0 6px 0;
-}
-.stack {
-  width: 220px;
-  position: relative;
-}
+/* “牌堆”视觉 */
+.stack-wrap{ display:flex; justify-content:center; margin: 8px 0 0 0; }
+.stack{ width: 210px; position:relative; }
 .stack::before, .stack::after{
-  content:"";
-  position:absolute;
-  inset:0;
-  border-radius: 16px;
-  background: rgba(255,255,255,0.03);
+  content:""; position:absolute; inset:0;
+  border-radius: 16px; background: rgba(255,255,255,0.03);
   border: 1px solid rgba(255,255,255,0.10);
-  transform: translate(10px, 10px);
-  z-index: 0;
+  transform: translate(10px, 10px); z-index:0;
 }
-.stack::after{
-  transform: translate(6px, 6px);
-  z-index: 1;
-}
+.stack::after{ transform: translate(6px,6px); z-index:1; }
 .stack-inner{
-  position: relative;
-  z-index: 2;
-  border-radius: 16px;
-  overflow:hidden;
+  position:relative; z-index:2;
+  border-radius:16px; overflow:hidden;
   border: 1px solid rgba(255,255,255,0.16);
   box-shadow: 0 18px 50px rgba(0,0,0,0.35);
 }
-.stack-meta{
-  text-align:center;
-  opacity:0.92;
-  font-size: 0.92rem;
-}
 
-@media (max-width: 600px) {
-  .stack { width: 190px; }
-  .card-back-placeholder { height: 160px; }
-  .stButton > button { padding: 9px 12px !important; font-size: 16px !important; }
+@keyframes flipIn {
+  0%   { transform: perspective(900px) rotateY(70deg) translateY(10px); opacity: 0; }
+  60%  { transform: perspective(900px) rotateY(-10deg) translateY(0px); opacity: 1; }
+  100% { transform: perspective(900px) rotateY(0deg) translateY(0px); opacity: 1; }
+}
+.revealed-anim { animation: flipIn 650ms ease; transform-origin: center; }
+
+@media (max-width:600px){
+  .stack{ width: 180px; }
+  .card-back-placeholder{ height: 140px; font-size: 2rem; }
+  .stButton>button{ padding: 9px 12px !important; font-size: 16px !important; }
 }
 </style>
 """,
     unsafe_allow_html=True,
 )
 
-# =========================
-# 5) 工具：洗牌进度
-# =========================
 def do_shuffle(seconds: int):
     if seconds <= 0:
         return
@@ -268,7 +243,7 @@ def render_card_back():
         st.markdown('<div class="card-back-placeholder">🂠</div>', unsafe_allow_html=True)
 
 # =========================
-# 6) 状态初始化
+# 5) 状态
 # =========================
 if "history" not in st.session_state:
     st.session_state["history"] = []
@@ -277,37 +252,37 @@ if "stage" not in st.session_state:
 if "followup_answers" not in st.session_state:
     st.session_state["followup_answers"] = {}
 if "deck" not in st.session_state:
-    st.session_state["deck"] = None  # 洗牌后的整副牌（列表）
+    st.session_state["deck"] = None
 if "drawn_cards" not in st.session_state:
-    st.session_state["drawn_cards"] = []  # 已抽出的3张
+    st.session_state["drawn_cards"] = []
+if "reveal_index" not in st.session_state:
+    st.session_state["reveal_index"] = -1  # -1 表示还没翻开任何牌
 if "reading" not in st.session_state:
     st.session_state["reading"] = None
-if "pull" not in st.session_state:
-    st.session_state["pull"] = 0  # 上滑拉条数值
 
 # =========================
-# 7) 顶部：步骤指示器
+# 6) 顶部步骤条
 # =========================
-steps = ["写问题", "回答追问", "上滑抽牌", "查看解读"]
+steps = ["写问题", "回答追问", "一键抽牌并翻牌", "查看解读"]
 stage_map = {"ask": 0, "followup": 1, "draw": 2, "reading": 3}
 cur = stage_map.get(st.session_state.get("stage", "ask"), 0)
 st.markdown(f"**步骤：{cur+1}/{len(steps)} — {steps[cur]}**")
 st.progress((cur + 1) / len(steps))
 
 # =========================
-# 8) 页面主体
+# 7) 页面主体
 # =========================
-st.title("🔮 塔罗占卜（上滑抽牌·追问式）")
-st.caption("不再铺开一堆牌：像线下一样一叠卡牌 → 你用“上滑抽取”抽 3 张（过去/现在/未来）。")
+st.title("🔮 塔罗占卜（点击抽牌·逐张翻牌）")
+st.caption("手机优化：不铺开大图卡墙，只显示一叠牌背 + 逐张翻开（过去/现在/未来）。")
 
-# 侧边栏设置（保留必要项）
+# 侧边栏
 st.sidebar.header("🧭 设置")
 topic = st.sidebar.selectbox("问题类型", ["综合", "恋爱", "事业", "学业", "自我成长"])
 tone = st.sidebar.selectbox("解读风格", ["温和", "直接", "治愈"])
 show_base_meaning = st.sidebar.checkbox("显示基础牌义", value=True)
 shuffle_seconds = st.sidebar.slider("洗牌动画时长（秒）", 0, 5, 1)
 
-st.info("📱 手机用户：请把下面的“上滑抽取”滑块从 0 拉到 100（像上滑抽出卡片），每次到顶就会抽一张牌。")
+st.info("📱 手机用户：点“一键抽牌”后，再点“翻开下一张”，依次翻出过去/现在/未来。")
 
 question = st.text_input("你想问什么？", placeholder="例如：我该不该换工作？这段关系未来一个月怎么走？")
 
@@ -321,23 +296,20 @@ with colx:
             st.session_state["reading"] = None
             st.session_state["deck"] = None
             st.session_state["drawn_cards"] = []
-            st.session_state["pull"] = 0
+            st.session_state["reveal_index"] = -1
             st.session_state["followup_answers"] = {}
             st.rerun()
-
 with coly:
     if st.button("🔄 重新开始（清空）"):
         st.session_state["stage"] = "ask"
         st.session_state["reading"] = None
         st.session_state["deck"] = None
         st.session_state["drawn_cards"] = []
-        st.session_state["pull"] = 0
+        st.session_state["reveal_index"] = -1
         st.session_state["followup_answers"] = {}
         st.rerun()
 
-# =========================
-# 9) 阶段：追问
-# =========================
+# 追问阶段
 if st.session_state["stage"] in ["followup", "draw", "reading"]:
     st.subheader("✅ 第一步：回答两个关键问题")
     q1, opts1 = FOLLOW_UP.get(topic, FOLLOW_UP["综合"])[0]
@@ -348,91 +320,111 @@ if st.session_state["stage"] in ["followup", "draw", "reading"]:
 
     c1, c2 = st.columns([1, 1])
     with c1:
-        if st.button("🌀 下一步：洗牌并开始抽牌"):
+        if st.button("🃏 下一步：一键抽牌（生成3张）"):
             do_shuffle(shuffle_seconds)
-            # 洗牌：打乱整副牌（这里用 random.sample 生成洗牌顺序）
+            # 洗牌并抽 3 张（不铺开）
             shuffled = random.sample(CARDS, k=len(CARDS))
-            st.session_state["deck"] = [make_card(c) for c in shuffled]
-            st.session_state["drawn_cards"] = []
+            deck = [make_card(c) for c in shuffled]
+            pos_order = ["过去", "现在", "未来"]
+            drawn = []
+            for i in range(3):
+                card = dict(deck[i])
+                card["pos_label"] = pos_order[i]
+                drawn.append(card)
+            st.session_state["deck"] = deck
+            st.session_state["drawn_cards"] = drawn
+            st.session_state["reveal_index"] = -1
             st.session_state["reading"] = None
-            st.session_state["pull"] = 0
             st.session_state["stage"] = "draw"
             st.rerun()
     with c2:
-        if st.button("跳过追问并继续（可选）"):
+        if st.button("跳过追问并抽牌（可选）"):
             st.session_state["followup_answers"] = {}
             do_shuffle(shuffle_seconds)
             shuffled = random.sample(CARDS, k=len(CARDS))
-            st.session_state["deck"] = [make_card(c) for c in shuffled]
-            st.session_state["drawn_cards"] = []
+            deck = [make_card(c) for c in shuffled]
+            pos_order = ["过去", "现在", "未来"]
+            drawn = []
+            for i in range(3):
+                card = dict(deck[i])
+                card["pos_label"] = pos_order[i]
+                drawn.append(card)
+            st.session_state["deck"] = deck
+            st.session_state["drawn_cards"] = drawn
+            st.session_state["reveal_index"] = -1
             st.session_state["reading"] = None
-            st.session_state["pull"] = 0
             st.session_state["stage"] = "draw"
             st.rerun()
 
-# =========================
-# 10) 阶段：上滑抽牌（用滑块模拟上滑手势）
-# =========================
-pos_order = ["过去", "现在", "未来"]
-
-if st.session_state["stage"] in ["draw", "reading"] and st.session_state["deck"] is not None:
-    st.subheader("🃏 第二步：上滑抽取三张牌（过去 / 现在 / 未来）")
+# 抽牌&翻牌阶段（不铺开卡墙）
+if st.session_state["stage"] in ["draw", "reading"] and st.session_state["drawn_cards"]:
+    st.subheader("🃏 第二步：逐张翻牌（过去 / 现在 / 未来）")
 
     drawn = st.session_state["drawn_cards"]
-    n = len(drawn)
-    next_pos = pos_order[n] if n < 3 else None
+    reveal = st.session_state["reveal_index"]
 
-    st.markdown(f"**进度：已抽 {n}/3**" + (f" ，下一张是：**{next_pos}**" if next_pos else " ✅ 已抽满"))
-
-    # 卡牌堆视觉
+    # 牌堆展示（固定大小，手机不占屏）
     st.markdown('<div class="stack-wrap"><div class="stack"><div class="stack-inner">', unsafe_allow_html=True)
     render_card_back()
     st.markdown('</div></div></div>', unsafe_allow_html=True)
 
-    remain = max(0, len(st.session_state["deck"]) - len(drawn))
-    st.markdown(f'<div class="stack-meta">牌堆剩余：{remain} 张</div>', unsafe_allow_html=True)
-
-    # 撤销最后一张（像把牌塞回去）
-    if drawn:
-        if st.button("↩️ 撤销最后一张（放回牌堆）"):
-            drawn.pop()
+    # 控制按钮
+    b1, b2, b3 = st.columns([1,1,1])
+    with b1:
+        if st.button("翻开下一张"):
+            if reveal < 2:
+                st.session_state["reveal_index"] = reveal + 1
+                st.session_state["reading"] = None
+                st.session_state["stage"] = "draw"
+                st.rerun()
+            else:
+                st.info("已经全部翻开～")
+    with b2:
+        if st.button("↩️ 撤销上一张"):
+            if reveal >= 0:
+                st.session_state["reveal_index"] = reveal - 1
+                st.session_state["reading"] = None
+                st.session_state["stage"] = "draw"
+                st.rerun()
+            else:
+                st.info("还没有翻开任何牌～")
+    with b3:
+        if st.button("重新抽一组"):
+            st.session_state["drawn_cards"] = []
+            st.session_state["reveal_index"] = -1
             st.session_state["reading"] = None
-            st.session_state["pull"] = 0
-            st.session_state["stage"] = "draw"
+            st.session_state["stage"] = "followup"
             st.rerun()
 
-    # 上滑拉条（模拟动作）
-    disabled = n >= 3
-    st.session_state["pull"] = st.slider(
-        "上滑抽取（把滑块拉到 100 触发抽牌）",
-        0, 100, int(st.session_state.get("pull", 0)),
-        key="pull_slider",
-        disabled=disabled
-    )
-
-    # 触发抽牌阈值
-    if (not disabled) and st.session_state["pull"] >= 95:
-        # 从洗好的 deck 里依次取下一张
-        idx = len(drawn)
-        card = dict(st.session_state["deck"][idx])
-        card["pos_label"] = pos_order[idx]
-        drawn.append(card)
-
-        # 重置拉条
-        st.session_state["pull"] = 0
-        st.session_state["stage"] = "draw"
-        st.rerun()
-
-    # 展示已抽出的牌
-    if drawn:
-        st.markdown("### 已抽出的牌")
-        for c in drawn:
-            st.markdown(f"**{c.get('pos_label','')}｜{c['name']}（{c['position']}）**")
+    # 展示已翻开的牌
+    st.markdown("### 已翻开的牌")
+    for i in range(3):
+        if i <= reveal:
+            c = drawn[i]
+            st.markdown(
+                f"""
+<div class="tarot-card revealed-anim">
+  <div><span class="badge">{c.get('pos_label','')}</span> {c['name']}（{c['position']}）</div>
+  <div class="small">已翻开</div>
+</div>
+""",
+                unsafe_allow_html=True,
+            )
             if show_base_meaning:
                 st.caption(f"基础牌义：{c['meaning']}")
+        else:
+            st.markdown(
+                f"""
+<div class="tarot-card">
+  <div><span class="badge">{['过去','现在','未来'][i]}</span> 未翻开</div>
+  <div class="small">点击「翻开下一张」</div>
+</div>
+""",
+                unsafe_allow_html=True,
+            )
 
-    # 抽满 3 张后自动生成解读
-    if len(drawn) == 3 and st.session_state["reading"] is None:
+    # 翻完后生成解读
+    if reveal >= 2 and st.session_state["reading"] is None:
         st.divider()
         st.subheader("🔮 第三步：生成解读")
         with st.spinner("正在生成更具体的解读..."):
@@ -457,7 +449,7 @@ if st.session_state["stage"] in ["draw", "reading"] and st.session_state["deck"]
                 "question": question,
                 "topic": topic,
                 "tone": tone,
-                "spread": "上滑抽牌三牌（过去-现在-未来）",
+                "spread": "点击抽牌三牌（过去-现在-未来）",
                 "followup": st.session_state["followup_answers"],
                 "cards": drawn,
                 "reading": data
@@ -466,9 +458,7 @@ if st.session_state["stage"] in ["draw", "reading"] and st.session_state["deck"]
         st.session_state["stage"] = "reading"
         st.rerun()
 
-# =========================
-# 11) 展示解读
-# =========================
+# 展示解读
 if st.session_state["reading"] is not None:
     rd = st.session_state["reading"]
     st.divider()
@@ -478,7 +468,6 @@ if st.session_state["reading"] is not None:
         st.write(rd["raw"])
     else:
         st.markdown(f"## {rd.get('one_line','') or ''}")
-
         kws = rd.get("keywords_used", [])
         if kws:
             st.caption("关键词：" + " / ".join(kws))
@@ -517,9 +506,7 @@ if st.session_state["reading"] is not None:
         for c in rd.get("caution", []):
             st.markdown(f"- {c}")
 
-# =========================
-# 12) 历史
-# =========================
+# 历史
 st.divider()
 st.subheader("📜 抽牌记录（本次打开页面期间）")
 if st.button("清空记录"):
