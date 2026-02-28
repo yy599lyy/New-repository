@@ -1,4 +1,4 @@
-# app.py
+# app.py (CN paywall version: WeChat/Alipay QR + admin grant credits)
 import os
 import json
 import random
@@ -12,7 +12,6 @@ import uuid
 import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
-import stripe
 
 # =========================
 # 0) 配置读取（部署/本地都稳）
@@ -28,41 +27,30 @@ def get_cfg(name: str, default: str = "") -> str:
         pass
     return os.getenv(name, default)
 
-# ARK / OpenAI Compatible
 ARK_API_KEY = get_cfg("ARK_API_KEY")
 ARK_BASE_URL = get_cfg("ARK_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
 MODEL_NAME = get_cfg("ARK_MODEL")
-
-# Stripe
-STRIPE_SECRET_KEY = get_cfg("STRIPE_SECRET_KEY")
-STRIPE_PRICE_ID = get_cfg("STRIPE_PRICE_ID")
-APP_BASE_URL = get_cfg("APP_BASE_URL")  # 必填：你的线上域名（含 https://）
+ADMIN_KEY = get_cfg("ADMIN_KEY")  # 管理员口令：用于后台发放次数
 
 st.set_page_config(page_title="塔罗占卜", page_icon="🔮", initial_sidebar_state="collapsed")
 
 missing = []
 if not ARK_API_KEY: missing.append("ARK_API_KEY")
 if not MODEL_NAME: missing.append("ARK_MODEL")
-if not STRIPE_SECRET_KEY: missing.append("STRIPE_SECRET_KEY")
-if not STRIPE_PRICE_ID: missing.append("STRIPE_PRICE_ID")
-if not APP_BASE_URL: missing.append("APP_BASE_URL")
+if not ADMIN_KEY: missing.append("ADMIN_KEY")
 
 if missing:
     st.error("缺少配置（Secrets / 环境变量）： " + ", ".join(missing))
     st.code(
         'ARK_API_KEY="..."\n'
         'ARK_BASE_URL="https://ark.cn-beijing.volces.com/api/v3"\n'
-        'ARK_MODEL="..."\n\n'
-        'STRIPE_SECRET_KEY="sk_live_..."  # 或 sk_test_...\n'
-        'STRIPE_PRICE_ID="price_..."\n'
-        'APP_BASE_URL="https://你的应用域名"\n',
+        'ARK_MODEL="..."\n'
+        'ADMIN_KEY="设置一个很长的口令"\n',
         language="toml",
     )
     st.stop()
 
 client = OpenAI(api_key=ARK_API_KEY, base_url=ARK_BASE_URL)
-
-stripe.api_key = STRIPE_SECRET_KEY
 
 # =========================
 # 1) 牌库
@@ -70,6 +58,8 @@ stripe.api_key = STRIPE_SECRET_KEY
 BASE_DIR = pathlib.Path(__file__).parent
 CARDS_PATH = BASE_DIR / "cards.json"
 CARD_BACK_PATH = BASE_DIR / "card_back.png"
+WX_QR_PATH = BASE_DIR / "wx_pay.png"
+ALI_QR_PATH = BASE_DIR / "ali_pay.png"
 
 @st.cache_data
 def load_cards():
@@ -110,9 +100,9 @@ FOLLOW_UP = {
 }
 
 # =========================
-# 3) SQLite：限免计数 + 深度次数 + Stripe Session 防重复发放
+# 3) SQLite：限免计数 + 深度次数 + 付款申诉记录
 # =========================
-FREE_PER_DAY = 1  # 每天免费次数（按 uid 计）
+FREE_PER_DAY = 1
 DB_PATH = str((BASE_DIR / "tarot.db").resolve())
 
 def db_conn():
@@ -140,10 +130,15 @@ def db_init():
     )
     """)
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS stripe_sessions (
-        session_id TEXT PRIMARY KEY,
+    CREATE TABLE IF NOT EXISTS pay_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
         uid TEXT,
-        processed_at TEXT
+        channel TEXT,
+        order_no TEXT,
+        contact TEXT,
+        note TEXT,
+        created_at TEXT,
+        status TEXT DEFAULT 'pending'
     )
     """)
     conn.commit()
@@ -216,22 +211,32 @@ def consume_deep_credit(uid: str, n: int = 1) -> bool:
     conn.close()
     return True
 
-def stripe_session_already_processed(session_id: str) -> bool:
-    conn = db_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM stripe_sessions WHERE session_id=?", (session_id,))
-    row = cur.fetchone()
-    conn.close()
-    return bool(row)
-
-def mark_stripe_session_processed(session_id: str, uid: str):
-    now = datetime.datetime.utcnow().isoformat()
+def create_pay_request(uid: str, channel: str, order_no: str, contact: str, note: str):
+    now = datetime.datetime.now().isoformat(timespec="seconds")
     conn = db_conn()
     cur = conn.cursor()
     cur.execute(
-        "INSERT OR IGNORE INTO stripe_sessions(session_id, uid, processed_at) VALUES(?,?,?)",
-        (session_id, uid, now),
+        "INSERT INTO pay_requests(uid, channel, order_no, contact, note, created_at) VALUES(?,?,?,?,?,?)",
+        (uid, channel, order_no, contact, note, now),
     )
+    conn.commit()
+    conn.close()
+
+def fetch_pending_requests(limit: int = 50):
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, uid, channel, order_no, contact, note, created_at, status FROM pay_requests ORDER BY id DESC LIMIT ?",
+        (limit,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def mark_request_done(req_id: int):
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE pay_requests SET status='done' WHERE id=?", (req_id,))
     conn.commit()
     conn.close()
 
@@ -239,56 +244,7 @@ db_init()
 uid = get_or_create_uid()
 
 # =========================
-# 4) Stripe：创建 Checkout Session + 回跳校验并发放次数
-# =========================
-def create_checkout_session(uid: str) -> str:
-    # success_url 需要带 {CHECKOUT_SESSION_ID} 模板变量
-    # Stripe 文档：success_url?session_id={CHECKOUT_SESSION_ID} :contentReference[oaicite:1]{index=1}
-    success_url = f"{APP_BASE_URL}?uid={uid}&success=1&session_id={{CHECKOUT_SESSION_ID}}"
-    cancel_url = f"{APP_BASE_URL}?uid={uid}&canceled=1"
-
-    session = stripe.checkout.Session.create(
-        mode="payment",
-        line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
-        success_url=success_url,
-        cancel_url=cancel_url,
-        client_reference_id=uid,  # Stripe API 允许用来对账/关联内部ID :contentReference[oaicite:2]{index=2}
-        metadata={"uid": uid, "credits": "1"},
-    )
-    # session.url 是 Stripe 托管支付页
-    return session.url
-
-def verify_and_grant_from_session(uid: str, session_id: str) -> tuple[bool, str]:
-    if not session_id:
-        return False, "缺少 session_id"
-
-    if stripe_session_already_processed(session_id):
-        return True, "已确认支付（本订单已处理过），深度次数已到账。"
-
-    try:
-        sess = stripe.checkout.Session.retrieve(session_id)
-    except Exception as e:
-        return False, f"查询支付失败：{e}"
-
-    # 关键字段通常是 payment_status == 'paid'
-    payment_status = getattr(sess, "payment_status", None)
-    status = getattr(sess, "status", None)
-
-    if payment_status != "paid":
-        return False, f"支付未完成（status={status}, payment_status={payment_status}）"
-
-    # 防止别人拿别人的 session_id 乱刷：校验 client_reference_id / metadata uid
-    sess_uid = getattr(sess, "client_reference_id", None) or (getattr(sess, "metadata", {}) or {}).get("uid")
-    if sess_uid and str(sess_uid) != str(uid):
-        return False, "支付订单与当前用户不匹配（UID校验失败）"
-
-    # 发放深度次数 +1，并记录该 session 已处理（防重复）
-    add_deep_credits(uid, 1)
-    mark_stripe_session_processed(session_id, uid)
-    return True, "支付成功 ✅ 已自动发放：深度次数 +1"
-
-# =========================
-# 5) JSON 解析 + 修复（稳）
+# 4) JSON 解析 + 修复
 # =========================
 def parse_json_safely(text: str):
     if not text:
@@ -329,7 +285,7 @@ def repair_json_with_model(raw_text: str) -> dict | None:
     return parse_json_safely(fixed)
 
 # =========================
-# 6) AI：免费版/深度版
+# 5) AI：免费版/深度版
 # =========================
 def ai_free(question, cards, topic, tone, fu):
     prompt = f"""
@@ -393,7 +349,7 @@ def ai_deep(question, cards, topic, tone, fu):
     return r.choices[0].message.content
 
 # =========================
-# 7) UI 样式
+# 6) UI 样式
 # =========================
 st.markdown(
     """
@@ -447,7 +403,7 @@ st.markdown(
 @keyframes flipIn{
   0%{ transform: perspective(900px) rotateY(70deg) translateY(10px); opacity:0; }
   60%{ transform: perspective(900px) rotateY(-10deg) translateY(0px); opacity:1; }
-  100%{ transform: perspective(900px) rotateY(0deg) translateY(0px); opacity:1; }
+  100%{ transform: perspective(900px) rotateY(0deg) translateY(0deg); opacity:1; }
 }
 .revealed-anim{ animation: flipIn 650ms ease; transform-origin:center; }
 .paywall{
@@ -477,7 +433,7 @@ def do_shuffle(seconds: int):
         p.progress((i + 1) / steps)
     p.empty()
 
-def show_paywall():
+def show_paywall(uid: str):
     st.markdown(
         """
 <div class="paywall">
@@ -485,13 +441,28 @@ def show_paywall():
   ✔ 每张牌：影响点 + 迹象 + 行动（更具体）<br/>
   ✔ 3条观察信号 + 2条“如果…那么…”策略<br/>
   ✔ 7天行动计划<br/>
-  <div style="opacity:.75;margin-top:8px;">
-    点击下方按钮进入 Stripe 安全支付，支付成功将自动发放「深度次数 +1」
+  <div style="opacity:.78;margin-top:10px;">
+    支付后提交「付款单号/截图 + UID」，我会给你发放深度次数（自动在你UID下到账）。
   </div>
 </div>
 """,
         unsafe_allow_html=True,
     )
+
+    st.markdown("### 💳 立即支付（微信 / 支付宝）")
+    c1, c2 = st.columns(2)
+    with c1:
+        if WX_QR_PATH.exists():
+            st.image(str(WX_QR_PATH), caption="微信扫码支付 ¥9.9", use_container_width=True)
+        else:
+            st.warning("缺少 wx_pay.png（微信收款码图片）")
+    with c2:
+        if ALI_QR_PATH.exists():
+            st.image(str(ALI_QR_PATH), caption="支付宝扫码支付 ¥9.9", use_container_width=True)
+        else:
+            st.warning("缺少 ali_pay.png（支付宝收款码图片）")
+
+    st.info(f"付款备注建议写：UID:{uid}（方便自动匹配）")
 
 def reading_to_text(rd: dict) -> str:
     if not isinstance(rd, dict):
@@ -500,46 +471,36 @@ def reading_to_text(rd: dict) -> str:
         return rd.get("raw", "")
     lines = []
     one = rd.get("one_line", "")
-    if one:
-        lines.append(f"一句话结论：{one}")
+    if one: lines.append(f"一句话结论：{one}")
     kws = rd.get("keywords_used") or []
-    if kws:
-        lines.append("关键词：" + " / ".join(kws))
+    if kws: lines.append("关键词：" + " / ".join(kws))
     uc = rd.get("user_context", "")
-    if uc:
-        lines.append("\n【我理解你的处境】\n" + uc)
+    if uc: lines.append("\n【我理解你的处境】\n" + uc)
     overall = rd.get("overall") or []
     if overall:
         lines.append("\n【整体能量】")
-        for s in overall:
-            lines.append(f"- {s}")
+        for s in overall: lines.append(f"- {s}")
     cr = rd.get("card_readings") or []
     if cr:
         lines.append("\n【逐牌解读】")
         for item in cr:
             head = f"{item.get('position','')}｜{item.get('card','')}（{item.get('orientation','')}）"
             lines.append(head)
-            if item.get("impact"):
-                lines.append(f"  影响点：{item.get('impact')}")
-            if item.get("signal"):
-                lines.append(f"  迹象：{item.get('signal')}")
-            if item.get("action"):
-                lines.append(f"  动作：{item.get('action')}")
+            if item.get("impact"): lines.append(f"  影响点：{item.get('impact')}")
+            if item.get("signal"): lines.append(f"  迹象：{item.get('signal')}")
+            if item.get("action"): lines.append(f"  动作：{item.get('action')}")
     advice = rd.get("advice") or []
     if advice:
         lines.append("\n【建议】")
-        for a in advice:
-            lines.append(f"- {a}")
+        for a in advice: lines.append(f"- {a}")
     sig = rd.get("signals_to_watch") or []
     if sig:
         lines.append("\n【接下来观察什么】")
-        for s in sig:
-            lines.append(f"- {s}")
+        for s in sig: lines.append(f"- {s}")
     itp = rd.get("if_then_plan") or []
     if itp:
         lines.append("\n【如果…那么…】")
-        for p in itp:
-            lines.append(f"- {p}")
+        for p in itp: lines.append(f"- {p}")
     p7 = rd.get("plan_7_days") or []
     if p7:
         lines.append("\n【7天行动计划】")
@@ -548,16 +509,15 @@ def reading_to_text(rd: dict) -> str:
     caut = rd.get("caution") or []
     if caut:
         lines.append("\n【提醒】")
-        for c in caut:
-            lines.append(f"- {c}")
+        for c in caut: lines.append(f"- {c}")
     return "\n".join(lines).strip()
 
 # =========================
-# 8) session_state（流程状态）
+# 7) session_state（流程状态）
 # =========================
 def init_state():
     defaults = {
-        "stage": "ask",               # ask -> followup -> draw -> reading
+        "stage": "ask",
         "followup_answers": {},
         "drawn_cards": [],
         "reveal_index": -1,
@@ -567,7 +527,6 @@ def init_state():
         "last_question": "",
         "last_topic": "综合",
         "last_tone": "温和",
-        "checkout_url": "",           # Stripe Checkout URL
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -576,23 +535,7 @@ def init_state():
 init_state()
 
 # =========================
-# 9) 处理 Stripe 回跳：success / canceled
-# =========================
-qp = st.query_params
-if (qp.get("canceled") or "").strip() == "1":
-    st.warning("你已取消支付（未扣款）。")
-
-if (qp.get("success") or "").strip() == "1":
-    session_id = (qp.get("session_id") or "").strip()
-    if session_id:
-        ok, msg = verify_and_grant_from_session(uid, session_id)
-        if ok:
-            st.success(msg)
-        else:
-            st.error(msg)
-
-# =========================
-# 10) 顶部步骤条
+# 8) 顶部步骤条
 # =========================
 steps = ["写问题", "回答追问", "抽牌并翻牌", "查看解读"]
 stage_map = {"ask": 0, "followup": 1, "draw": 2, "reading": 3}
@@ -601,10 +544,10 @@ st.markdown(f"**步骤：{cur+1}/{len(steps)} — {steps[cur]}**")
 st.progress((cur + 1) / len(steps))
 
 # =========================
-# 11) 页面主体
+# 9) 页面主体
 # =========================
-st.title("🔮 塔罗占卜（Stripe 自动支付版）")
-st.caption("免费每日 1 次（按UID）；深度解读 ¥9.9/次（Stripe 支付成功自动发放深度次数）。")
+st.title("🔮 塔罗占卜（国内收款版）")
+st.caption("免费每日 1 次（按UID）；深度解读 ¥9.9/次（扫码支付后发放深度次数，可直接升级本次结果）。")
 st.caption("免责声明：内容仅供娱乐与自我反思，不替代医疗/法律/财务等专业意见。")
 
 # 侧边栏
@@ -627,23 +570,53 @@ deep_left = get_deep_credits(uid)
 st.info(f"🆓 今日剩余免费：{free_left}/{FREE_PER_DAY}   |   💎 深度次数：{deep_left}")
 st.caption(f"UID：{uid}（用于按天限免与次数保存）")
 
-# 支付入口（付费墙 + Stripe 按钮）
-with st.expander("💳 解锁深度解读（Stripe 支付 ¥9.9 自动到账）", expanded=False):
-    show_paywall()
+# 付费墙：扫码 + 提交信息
+with st.expander("💳 解锁深度解读（扫码支付 ¥9.9）", expanded=False):
+    show_paywall(uid)
+    st.markdown("### ✅ 付款后提交（便于自动发放次数）")
+    with st.form("pay_form"):
+        channel = st.selectbox("支付方式", ["微信", "支付宝"])
+        order_no = st.text_input("交易单号/转账单号（或付款备注）", placeholder="例如：2026xxxxxx 或 备注UID:xxxx")
+        contact = st.text_input("联系方式（微信号/手机号/邮箱）", placeholder="用于联系你确认")
+        note = st.text_area("补充说明（可选）", placeholder="例如：我已支付，备注写了UID:xxxx")
+        submitted = st.form_submit_button("提交（我已付款）")
+        if submitted:
+            if not order_no.strip() and not contact.strip():
+                st.error("至少填写：交易单号/备注 或 联系方式（任一即可）")
+            else:
+                create_pay_request(uid, channel, order_no.strip(), contact.strip(), note.strip())
+                st.success("已提交 ✅ 我会尽快为你的 UID 发放深度次数。")
 
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        if st.button("🔒 立即支付 ¥9.9（Stripe Checkout）"):
-            try:
-                st.session_state["checkout_url"] = create_checkout_session(uid)
-                st.success("已生成支付链接，请点击右侧按钮进入支付。")
-            except Exception as e:
-                st.error(f"创建支付链接失败：{e}")
-
-    with c2:
-        if st.session_state.get("checkout_url"):
-            # Streamlit 官方提供 link_button 可直接打开链接（新标签页） :contentReference[oaicite:3]{index=3}
-            st.link_button("➡️ 打开 Stripe 支付页", st.session_state["checkout_url"])
+# 管理员后台：输入口令才显示
+with st.expander("🛠 管理员入口（发放深度次数）", expanded=False):
+    key = st.text_input("ADMIN_KEY", type="password", placeholder="仅管理员填写")
+    if key and key == ADMIN_KEY:
+        st.success("已进入管理员模式")
+        rows = fetch_pending_requests(limit=50)
+        st.write("待处理付款请求（最新在前）：")
+        for r in rows:
+            req_id, r_uid, ch, order_no, contact, note, created_at, status = r
+            box = st.container(border=True)
+            with box:
+                st.markdown(f"**ID:** {req_id}  |  **UID:** `{r_uid}`  |  **状态:** `{status}`  |  **时间:** {created_at}")
+                st.markdown(f"- 渠道：{ch}")
+                st.markdown(f"- 单号/备注：{order_no or '（空）'}")
+                st.markdown(f"- 联系方式：{contact or '（空）'}")
+                if note:
+                    st.markdown(f"- 说明：{note}")
+                c1, c2, c3 = st.columns([1,1,2])
+                with c1:
+                    n = st.number_input(f"发放次数（ID {req_id}）", min_value=1, max_value=20, value=1, step=1, key=f"grant_{req_id}")
+                with c2:
+                    if st.button(f"✅ 发放并标记完成", key=f"btn_grant_{req_id}"):
+                        add_deep_credits(r_uid, int(n))
+                        mark_request_done(req_id)
+                        st.success(f"已给 {r_uid} 发放深度次数 +{int(n)}")
+                        st.rerun()
+                with c3:
+                    st.caption("提示：发放后用户刷新页面即可看到次数到账。")
+    elif key:
+        st.error("口令不正确")
 
 # 问题输入
 question = st.text_input(
@@ -672,7 +645,7 @@ with col2:
             st.session_state[k] = {"stage":"ask","reading":None,"reading_is_deep":False,"drawn_cards":[],"reveal_index":-1,"followup_answers":{}}[k]
         st.rerun()
 
-# 追问阶段
+# 追问
 if st.session_state["stage"] in ["followup", "draw", "reading"]:
     st.subheader("✅ 第一步：回答两个关键问题")
     q1, opts1 = FOLLOW_UP.get(topic, FOLLOW_UP["综合"])[0]
@@ -718,7 +691,7 @@ if st.session_state["stage"] in ["followup", "draw", "reading"]:
             st.session_state["stage"] = "draw"
             st.rerun()
 
-# 翻牌阶段
+# 翻牌
 if st.session_state["stage"] in ["draw", "reading"] and st.session_state["drawn_cards"]:
     st.subheader("🃏 第二步：逐张翻牌（过去 / 现在 / 未来）")
     drawn = st.session_state["drawn_cards"]
@@ -781,7 +754,7 @@ if st.session_state["stage"] in ["draw", "reading"] and st.session_state["drawn_
                 unsafe_allow_html=True,
             )
 
-    # 翻完后生成解读：优先深度次数，否则每日免费
+    # 生成解读：优先深度次数，否则每日免费
     if reveal >= 2 and st.session_state["reading"] is None:
         st.divider()
         st.subheader("🔮 第三步：生成解读")
@@ -790,14 +763,14 @@ if st.session_state["stage"] in ["draw", "reading"] and st.session_state["drawn_
         want_deep = deep_left > 0
 
         if (not want_deep) and (not can_use_free(uid)):
-            st.warning("你今日免费次数已用完，且没有深度次数。请先支付解锁深度次数。")
-            show_paywall()
+            st.warning("你今日免费次数已用完，且没有深度次数。请扫码支付后提交信息以解锁。")
+            show_paywall(uid)
         else:
             with st.spinner("正在生成解读..."):
                 try:
                     if want_deep:
                         if not consume_deep_credit(uid, 1):
-                            st.error("深度次数不足，请先支付。")
+                            st.error("深度次数不足，请扫码支付。")
                             st.stop()
                         txt = ai_deep(question, drawn, topic, tone, st.session_state["followup_answers"])
                         reading_is_deep = True
@@ -897,7 +870,7 @@ if st.session_state["reading"] is not None:
             for c in caution:
                 st.markdown(f"- {c}")
 
-    # 下载报告（TXT + JSON）
+    # 下载报告
     st.divider()
     st.markdown("### 📥 下载报告")
     json_bytes = json.dumps(rd, ensure_ascii=False, indent=2).encode("utf-8")
@@ -905,14 +878,14 @@ if st.session_state["reading"] is not None:
     st.download_button("下载 JSON（结构化）", data=json_bytes, file_name="tarot_reading.json", mime="application/json")
     st.download_button("下载 TXT（可读版）", data=txt_bytes, file_name="tarot_reading.txt", mime="text/plain")
 
-    # 升级按钮：只有当前结果是免费版且有深度次数时显示
+    # 升级按钮：免费结果 + 有深度次数
     if (not is_deep) and (get_deep_credits(uid) > 0):
         st.divider()
         st.markdown("### 💎 升级本次为深度解读（不重抽牌）")
         st.caption("使用同一组牌与同一问题，生成更具体的行动步骤 / 观察信号 / 7天计划。")
         if st.button("升级为深度解读（消耗 1 次深度）"):
             if not consume_deep_credit(uid, 1):
-                st.error("深度次数不足，请先支付。")
+                st.error("深度次数不足，请扫码支付。")
             else:
                 with st.spinner("正在升级为深度解读..."):
                     try:
@@ -938,12 +911,12 @@ if st.session_state["reading"] is not None:
                 st.success("已升级为深度解读 ✅")
                 st.rerun()
 
-    # 没深度次数时的转化提示
+    # 没深度次数：提示付款入口
     if (not is_deep) and (get_deep_credits(uid) <= 0):
         st.divider()
         st.markdown("### 🌙 想要更具体的深度解读？")
-        st.write("点击上方「立即支付 ¥9.9」完成支付后，系统会自动发放 **深度次数 +1**，并可直接升级本次结果（不重抽牌）。")
-        show_paywall()
+        st.write("扫码支付后提交信息，深度次数会发放到你的 UID 下，然后你可以直接升级本次结果（不重抽牌）。")
+        show_paywall(uid)
 
 # 历史（会话内）
 st.divider()
@@ -954,7 +927,7 @@ with c1:
         st.session_state["history"] = []
         st.rerun()
 with c2:
-    st.caption("提示：记录仅在当前会话中显示；计费/限免/次数写入SQLite。")
+    st.caption("提示：记录仅在当前会话中显示；限免/次数写入SQLite。")
 
 if st.session_state["history"]:
     for idx, h in enumerate(st.session_state["history"][:8], start=1):
@@ -962,21 +935,7 @@ if st.session_state["history"]:
         st.markdown(f"### 记录 {idx}  {tag}")
         st.markdown(f"**时间：** {h.get('ts','')}")
         st.markdown(f"**问题：** {h.get('question','')}")
-        st.markdown(f"**类型/风格：** {h.get('topic','')} / {h.get('tone','')}")
-        fu = h.get("followup", {})
-        if fu:
-            with st.expander("追问答案"):
-                for k, v in fu.items():
-                    st.markdown(f"- {k}：{v}")
         for c in h.get("cards", []):
             st.markdown(f"- {c.get('pos_label','')} {c.get('name','')}（{c.get('position','')}）")
-        with st.expander("查看解读摘要"):
-            r = h.get("reading", {})
-            if isinstance(r, dict) and "raw" not in r:
-                st.markdown(f"**一句话结论：** {r.get('one_line','')}")
-                for a in (r.get("advice") or [])[:3]:
-                    st.markdown(f"- {a}")
-            else:
-                st.write(reading_to_text(r))
 else:
     st.caption("还没有记录，先按流程体验一次～")
