@@ -8,9 +8,11 @@ import re
 import datetime
 import sqlite3
 import uuid
+
 import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
+import stripe
 
 # =========================
 # 0) 配置读取（部署/本地都稳）
@@ -26,23 +28,41 @@ def get_cfg(name: str, default: str = "") -> str:
         pass
     return os.getenv(name, default)
 
+# ARK / OpenAI Compatible
 ARK_API_KEY = get_cfg("ARK_API_KEY")
 ARK_BASE_URL = get_cfg("ARK_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
 MODEL_NAME = get_cfg("ARK_MODEL")
 
+# Stripe
+STRIPE_SECRET_KEY = get_cfg("STRIPE_SECRET_KEY")
+STRIPE_PRICE_ID = get_cfg("STRIPE_PRICE_ID")
+APP_BASE_URL = get_cfg("APP_BASE_URL")  # 必填：你的线上域名（含 https://）
+
 st.set_page_config(page_title="塔罗占卜", page_icon="🔮", initial_sidebar_state="collapsed")
 
-if not ARK_API_KEY or not MODEL_NAME:
-    st.error("缺少配置：请在 Streamlit Cloud 的 Secrets 里设置 ARK_API_KEY 与 ARK_MODEL。")
+missing = []
+if not ARK_API_KEY: missing.append("ARK_API_KEY")
+if not MODEL_NAME: missing.append("ARK_MODEL")
+if not STRIPE_SECRET_KEY: missing.append("STRIPE_SECRET_KEY")
+if not STRIPE_PRICE_ID: missing.append("STRIPE_PRICE_ID")
+if not APP_BASE_URL: missing.append("APP_BASE_URL")
+
+if missing:
+    st.error("缺少配置（Secrets / 环境变量）： " + ", ".join(missing))
     st.code(
-        'ARK_API_KEY="你的key"\n'
+        'ARK_API_KEY="..."\n'
         'ARK_BASE_URL="https://ark.cn-beijing.volces.com/api/v3"\n'
-        'ARK_MODEL="你的模型名"\n',
+        'ARK_MODEL="..."\n\n'
+        'STRIPE_SECRET_KEY="sk_live_..."  # 或 sk_test_...\n'
+        'STRIPE_PRICE_ID="price_..."\n'
+        'APP_BASE_URL="https://你的应用域名"\n',
         language="toml",
     )
     st.stop()
 
 client = OpenAI(api_key=ARK_API_KEY, base_url=ARK_BASE_URL)
+
+stripe.api_key = STRIPE_SECRET_KEY
 
 # =========================
 # 1) 牌库
@@ -90,17 +110,9 @@ FOLLOW_UP = {
 }
 
 # =========================
-# 3) 变现：SQLite（限免计数 + 一次性激活码 + 深度次数）
+# 3) SQLite：限免计数 + 深度次数 + Stripe Session 防重复发放
 # =========================
 FREE_PER_DAY = 1  # 每天免费次数（按 uid 计）
-
-# 预置激活码：会 seed 到 DB（一次性）
-VALID_CODES = {
-    "TAROT9": True,
-    "VIP001": True,
-    "LOVE888": True,
-}
-
 DB_PATH = str((BASE_DIR / "tarot.db").resolve())
 
 def db_conn():
@@ -128,12 +140,10 @@ def db_init():
     )
     """)
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS codes (
-        code TEXT PRIMARY KEY,
-        remaining INT NOT NULL DEFAULT 1,
-        created_at TEXT,
-        used_at TEXT,
-        used_by TEXT
+    CREATE TABLE IF NOT EXISTS stripe_sessions (
+        session_id TEXT PRIMARY KEY,
+        uid TEXT,
+        processed_at TEXT
     )
     """)
     conn.commit()
@@ -150,20 +160,6 @@ def get_or_create_uid():
         st.query_params["uid"] = uid
         st.rerun()
     return uid
-
-def seed_codes_if_needed(codes: dict):
-    conn = db_conn()
-    cur = conn.cursor()
-    now = datetime.datetime.utcnow().isoformat()
-    for code, enabled in (codes or {}).items():
-        if not enabled:
-            continue
-        code = (code or "").strip()
-        if not code:
-            continue
-        cur.execute("INSERT OR IGNORE INTO codes(code, remaining, created_at) VALUES(?,?,?)", (code, 1, now))
-    conn.commit()
-    conn.close()
 
 def get_free_used(uid: str) -> int:
     conn = db_conn()
@@ -220,42 +216,79 @@ def consume_deep_credit(uid: str, n: int = 1) -> bool:
     conn.close()
     return True
 
-def redeem_code(uid: str, code: str) -> tuple[bool, str]:
-    code = (code or "").strip()
-    if not code:
-        return False, "请输入激活码"
+def stripe_session_already_processed(session_id: str) -> bool:
     conn = db_conn()
     cur = conn.cursor()
-    cur.execute("SELECT remaining FROM codes WHERE code=?", (code,))
+    cur.execute("SELECT 1 FROM stripe_sessions WHERE session_id=?", (session_id,))
     row = cur.fetchone()
-    if not row:
-        conn.close()
-        return False, "激活码不存在或无效"
-    remaining = int(row[0])
-    if remaining <= 0:
-        conn.close()
-        return False, "激活码已使用"
+    conn.close()
+    return bool(row)
+
+def mark_stripe_session_processed(session_id: str, uid: str):
     now = datetime.datetime.utcnow().isoformat()
-    cur.execute("""
-    UPDATE codes
-    SET remaining = remaining - 1, used_at=?, used_by=?
-    WHERE code=? AND remaining > 0
-    """, (now, uid, code))
-    if cur.rowcount <= 0:
-        conn.close()
-        return False, "激活码已使用"
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO stripe_sessions(session_id, uid, processed_at) VALUES(?,?,?)",
+        (session_id, uid, now),
+    )
     conn.commit()
     conn.close()
-    add_deep_credits(uid, 1)
-    return True, "兑换成功：深度解读次数 +1"
 
-# 初始化 DB & uid
 db_init()
 uid = get_or_create_uid()
-seed_codes_if_needed(VALID_CODES)
 
 # =========================
-# 4) JSON 解析 + 修复（稳）
+# 4) Stripe：创建 Checkout Session + 回跳校验并发放次数
+# =========================
+def create_checkout_session(uid: str) -> str:
+    # success_url 需要带 {CHECKOUT_SESSION_ID} 模板变量
+    # Stripe 文档：success_url?session_id={CHECKOUT_SESSION_ID} :contentReference[oaicite:1]{index=1}
+    success_url = f"{APP_BASE_URL}?uid={uid}&success=1&session_id={{CHECKOUT_SESSION_ID}}"
+    cancel_url = f"{APP_BASE_URL}?uid={uid}&canceled=1"
+
+    session = stripe.checkout.Session.create(
+        mode="payment",
+        line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+        success_url=success_url,
+        cancel_url=cancel_url,
+        client_reference_id=uid,  # Stripe API 允许用来对账/关联内部ID :contentReference[oaicite:2]{index=2}
+        metadata={"uid": uid, "credits": "1"},
+    )
+    # session.url 是 Stripe 托管支付页
+    return session.url
+
+def verify_and_grant_from_session(uid: str, session_id: str) -> tuple[bool, str]:
+    if not session_id:
+        return False, "缺少 session_id"
+
+    if stripe_session_already_processed(session_id):
+        return True, "已确认支付（本订单已处理过），深度次数已到账。"
+
+    try:
+        sess = stripe.checkout.Session.retrieve(session_id)
+    except Exception as e:
+        return False, f"查询支付失败：{e}"
+
+    # 关键字段通常是 payment_status == 'paid'
+    payment_status = getattr(sess, "payment_status", None)
+    status = getattr(sess, "status", None)
+
+    if payment_status != "paid":
+        return False, f"支付未完成（status={status}, payment_status={payment_status}）"
+
+    # 防止别人拿别人的 session_id 乱刷：校验 client_reference_id / metadata uid
+    sess_uid = getattr(sess, "client_reference_id", None) or (getattr(sess, "metadata", {}) or {}).get("uid")
+    if sess_uid and str(sess_uid) != str(uid):
+        return False, "支付订单与当前用户不匹配（UID校验失败）"
+
+    # 发放深度次数 +1，并记录该 session 已处理（防重复）
+    add_deep_credits(uid, 1)
+    mark_stripe_session_processed(session_id, uid)
+    return True, "支付成功 ✅ 已自动发放：深度次数 +1"
+
+# =========================
+# 5) JSON 解析 + 修复（稳）
 # =========================
 def parse_json_safely(text: str):
     if not text:
@@ -280,7 +313,6 @@ def parse_json_safely(text: str):
     return None
 
 def repair_json_with_model(raw_text: str) -> dict | None:
-    # 低成本“修 JSON”兜底：只要求输出严格 JSON
     prompt = f"""
 你是 JSON 修复器。把下面内容修复为【严格JSON】。
 要求：只输出JSON本体，不要任何多余文字/markdown/代码块。
@@ -297,7 +329,7 @@ def repair_json_with_model(raw_text: str) -> dict | None:
     return parse_json_safely(fixed)
 
 # =========================
-# 5) AI：免费版/深度版（两套 prompt）
+# 6) AI：免费版/深度版
 # =========================
 def ai_free(question, cards, topic, tone, fu):
     prompt = f"""
@@ -361,7 +393,7 @@ def ai_deep(question, cards, topic, tone, fu):
     return r.choices[0].message.content
 
 # =========================
-# 6) UI：样式（手机友好）
+# 7) UI 样式
 # =========================
 st.markdown(
     """
@@ -375,8 +407,6 @@ st.markdown(
   color: rgba(255,255,255,0.92);
 }
 .block-container{ padding-top: 1.1rem; max-width: 980px; }
-h1,h2,h3{ letter-spacing: .5px; }
-
 .tarot-card{
   border: 1px solid rgba(255,255,255,.16);
   border-radius: 18px;
@@ -391,7 +421,6 @@ h1,h2,h3{ letter-spacing: .5px; }
   margin-right:8px;
 }
 .small{ font-size:.88rem; opacity:.88; }
-
 .card-back-placeholder{
   background: linear-gradient(135deg,#2a1b3d,#1a0f2a);
   border:2px solid rgba(122,95,160,.6);
@@ -400,8 +429,6 @@ h1,h2,h3{ letter-spacing: .5px; }
   display:flex; align-items:center; justify-content:center;
   color:#bbaadd; font-size:2rem;
 }
-
-/* 牌堆视觉 */
 .stack-wrap{ display:flex; justify-content:center; margin: 8px 0 0 0; }
 .stack{ width: 170px; position:relative; }
 .stack::before, .stack::after{
@@ -417,14 +444,12 @@ h1,h2,h3{ letter-spacing: .5px; }
   border: 1px solid rgba(255,255,255,.16);
   box-shadow: 0 18px 50px rgba(0,0,0,.35);
 }
-
 @keyframes flipIn{
   0%{ transform: perspective(900px) rotateY(70deg) translateY(10px); opacity:0; }
   60%{ transform: perspective(900px) rotateY(-10deg) translateY(0px); opacity:1; }
   100%{ transform: perspective(900px) rotateY(0deg) translateY(0px); opacity:1; }
 }
 .revealed-anim{ animation: flipIn 650ms ease; transform-origin:center; }
-
 .paywall{
   border: 1px solid rgba(255,255,255,.18);
   border-radius: 16px;
@@ -461,7 +486,7 @@ def show_paywall():
   ✔ 3条观察信号 + 2条“如果…那么…”策略<br/>
   ✔ 7天行动计划<br/>
   <div style="opacity:.75;margin-top:8px;">
-    支付后输入一次性激活码，即可获得「深度次数 +1」
+    点击下方按钮进入 Stripe 安全支付，支付成功将自动发放「深度次数 +1」
   </div>
 </div>
 """,
@@ -483,13 +508,11 @@ def reading_to_text(rd: dict) -> str:
     uc = rd.get("user_context", "")
     if uc:
         lines.append("\n【我理解你的处境】\n" + uc)
-
     overall = rd.get("overall") or []
     if overall:
         lines.append("\n【整体能量】")
         for s in overall:
             lines.append(f"- {s}")
-
     cr = rd.get("card_readings") or []
     if cr:
         lines.append("\n【逐牌解读】")
@@ -502,41 +525,35 @@ def reading_to_text(rd: dict) -> str:
                 lines.append(f"  迹象：{item.get('signal')}")
             if item.get("action"):
                 lines.append(f"  动作：{item.get('action')}")
-
     advice = rd.get("advice") or []
     if advice:
         lines.append("\n【建议】")
         for a in advice:
             lines.append(f"- {a}")
-
     sig = rd.get("signals_to_watch") or []
     if sig:
         lines.append("\n【接下来观察什么】")
         for s in sig:
             lines.append(f"- {s}")
-
     itp = rd.get("if_then_plan") or []
     if itp:
         lines.append("\n【如果…那么…】")
         for p in itp:
             lines.append(f"- {p}")
-
     p7 = rd.get("plan_7_days") or []
     if p7:
         lines.append("\n【7天行动计划】")
         for i, x in enumerate(p7, start=1):
             lines.append(f"- Day {i}: {x}")
-
     caut = rd.get("caution") or []
     if caut:
         lines.append("\n【提醒】")
         for c in caut:
             lines.append(f"- {c}")
-
     return "\n".join(lines).strip()
 
 # =========================
-# 7) session_state（仅做流程状态，不做计数/付费）
+# 8) session_state（流程状态）
 # =========================
 def init_state():
     defaults = {
@@ -545,11 +562,12 @@ def init_state():
         "drawn_cards": [],
         "reveal_index": -1,
         "reading": None,
-        "reading_is_deep": False,     # 本次结果是深度吗
+        "reading_is_deep": False,
         "history": [],
         "last_question": "",
         "last_topic": "综合",
         "last_tone": "温和",
+        "checkout_url": "",           # Stripe Checkout URL
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -558,7 +576,23 @@ def init_state():
 init_state()
 
 # =========================
-# 8) 顶部步骤条
+# 9) 处理 Stripe 回跳：success / canceled
+# =========================
+qp = st.query_params
+if (qp.get("canceled") or "").strip() == "1":
+    st.warning("你已取消支付（未扣款）。")
+
+if (qp.get("success") or "").strip() == "1":
+    session_id = (qp.get("session_id") or "").strip()
+    if session_id:
+        ok, msg = verify_and_grant_from_session(uid, session_id)
+        if ok:
+            st.success(msg)
+        else:
+            st.error(msg)
+
+# =========================
+# 10) 顶部步骤条
 # =========================
 steps = ["写问题", "回答追问", "抽牌并翻牌", "查看解读"]
 stage_map = {"ask": 0, "followup": 1, "draw": 2, "reading": 3}
@@ -567,39 +601,49 @@ st.markdown(f"**步骤：{cur+1}/{len(steps)} — {steps[cur]}**")
 st.progress((cur + 1) / len(steps))
 
 # =========================
-# 9) 页面主体
+# 11) 页面主体
 # =========================
-st.title("🔮 塔罗占卜（可盈利版）")
-st.caption("免费每日 1 次（按UID）；深度解读 ¥9.9/次（一次性激活码兑换深度次数）。")
+st.title("🔮 塔罗占卜（Stripe 自动支付版）")
+st.caption("免费每日 1 次（按UID）；深度解读 ¥9.9/次（Stripe 支付成功自动发放深度次数）。")
 st.caption("免责声明：内容仅供娱乐与自我反思，不替代医疗/法律/财务等专业意见。")
 
 # 侧边栏
 st.sidebar.header("🧭 设置")
-topic = st.sidebar.selectbox("问题类型", ["综合", "恋爱", "事业", "学业", "自我成长"], index=["综合","恋爱","事业","学业","自我成长"].index(st.session_state["last_topic"]) if st.session_state["last_topic"] in ["综合","恋爱","事业","学业","自我成长"] else 0)
-tone = st.sidebar.selectbox("解读风格", ["温和", "直接", "治愈"], index=["温和","直接","治愈"].index(st.session_state["last_tone"]) if st.session_state["last_tone"] in ["温和","直接","治愈"] else 0)
+topic = st.sidebar.selectbox("问题类型", ["综合", "恋爱", "事业", "学业", "自我成长"],
+                             index=["综合","恋爱","事业","学业","自我成长"].index(st.session_state["last_topic"])
+                             if st.session_state["last_topic"] in ["综合","恋爱","事业","学业","自我成长"] else 0)
+tone = st.sidebar.selectbox("解读风格", ["温和", "直接", "治愈"],
+                            index=["温和","直接","治愈"].index(st.session_state["last_tone"])
+                            if st.session_state["last_tone"] in ["温和","直接","治愈"] else 0)
 show_base = st.sidebar.checkbox("显示基础牌义", value=True)
 shuffle_seconds = st.sidebar.slider("洗牌动画时长（秒）", 0, 5, 1)
 
 st.session_state["last_topic"] = topic
 st.session_state["last_tone"] = tone
 
-# 状态栏：按 UID & DB 统计
+# 状态栏
 free_left = max(0, FREE_PER_DAY - get_free_used(uid))
 deep_left = get_deep_credits(uid)
 st.info(f"🆓 今日剩余免费：{free_left}/{FREE_PER_DAY}   |   💎 深度次数：{deep_left}")
 st.caption(f"UID：{uid}（用于按天限免与次数保存）")
 
-# 激活码入口（转化入口）
-with st.expander("💳 输入一次性激活码兑换深度次数（¥9.9/次）", expanded=False):
+# 支付入口（付费墙 + Stripe 按钮）
+with st.expander("💳 解锁深度解读（Stripe 支付 ¥9.9 自动到账）", expanded=False):
     show_paywall()
-    code = st.text_input("激活码（一次性）", key="code_input").strip()
-    if st.button("兑换深度次数 +1"):
-        ok, msg = redeem_code(uid, code)
-        if ok:
-            st.success(msg)
-            st.rerun()
-        else:
-            st.error(msg)
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        if st.button("🔒 立即支付 ¥9.9（Stripe Checkout）"):
+            try:
+                st.session_state["checkout_url"] = create_checkout_session(uid)
+                st.success("已生成支付链接，请点击右侧按钮进入支付。")
+            except Exception as e:
+                st.error(f"创建支付链接失败：{e}")
+
+    with c2:
+        if st.session_state.get("checkout_url"):
+            # Streamlit 官方提供 link_button 可直接打开链接（新标签页） :contentReference[oaicite:3]{index=3}
+            st.link_button("➡️ 打开 Stripe 支付页", st.session_state["checkout_url"])
 
 # 问题输入
 question = st.text_input(
@@ -641,7 +685,7 @@ if st.session_state["stage"] in ["followup", "draw", "reading"]:
     with c1:
         if st.button("🃏 下一步：一键抽牌（生成3张）"):
             do_shuffle(shuffle_seconds)
-            chosen = random.sample(CARDS, k=3)  # 更省
+            chosen = random.sample(CARDS, k=3)
             deck = [make_card(c) for c in chosen]
             pos_order = ["过去", "现在", "未来"]
             drawn = []
@@ -737,7 +781,7 @@ if st.session_state["stage"] in ["draw", "reading"] and st.session_state["drawn_
                 unsafe_allow_html=True,
             )
 
-    # 翻完后生成解读（优先消耗深度次数；否则走每日免费）
+    # 翻完后生成解读：优先深度次数，否则每日免费
     if reveal >= 2 and st.session_state["reading"] is None:
         st.divider()
         st.subheader("🔮 第三步：生成解读")
@@ -746,14 +790,14 @@ if st.session_state["stage"] in ["draw", "reading"] and st.session_state["drawn_
         want_deep = deep_left > 0
 
         if (not want_deep) and (not can_use_free(uid)):
-            st.warning("你今日免费次数已用完，且没有深度次数。请兑换一次性激活码继续。")
+            st.warning("你今日免费次数已用完，且没有深度次数。请先支付解锁深度次数。")
             show_paywall()
         else:
             with st.spinner("正在生成解读..."):
                 try:
                     if want_deep:
                         if not consume_deep_credit(uid, 1):
-                            st.error("深度次数不足，请兑换激活码")
+                            st.error("深度次数不足，请先支付。")
                             st.stop()
                         txt = ai_deep(question, drawn, topic, tone, st.session_state["followup_answers"])
                         reading_is_deep = True
@@ -762,9 +806,7 @@ if st.session_state["stage"] in ["draw", "reading"] and st.session_state["drawn_
                         inc_free_used(uid, 1)
                         reading_is_deep = False
 
-                    data = parse_json_safely(txt)
-                    if not data:
-                        data = repair_json_with_model(txt)
+                    data = parse_json_safely(txt) or repair_json_with_model(txt)
 
                 except Exception as e:
                     data = None
@@ -773,7 +815,6 @@ if st.session_state["stage"] in ["draw", "reading"] and st.session_state["drawn_
             st.session_state["reading"] = data if data else {"raw": "（解析JSON失败，显示原始内容）\n\n" + (txt or "无返回")}
             st.session_state["reading_is_deep"] = reading_is_deep
 
-            # history（会话内）
             st.session_state["history"].insert(0, {
                 "question": question,
                 "topic": topic,
@@ -788,9 +829,7 @@ if st.session_state["stage"] in ["draw", "reading"] and st.session_state["drawn_
             st.session_state["stage"] = "reading"
             st.rerun()
 
-# =========================
-# 10) 展示解读 + “升级为深度”按钮 + 下载报告
-# =========================
+# 展示解读 + 下载 + 升级
 if st.session_state["reading"] is not None:
     rd = st.session_state["reading"]
     is_deep = bool(st.session_state.get("reading_is_deep", False))
@@ -798,7 +837,6 @@ if st.session_state["reading"] is not None:
     st.divider()
     st.subheader("✅ 第四步：查看解读")
 
-    # 标题
     if isinstance(rd, dict) and "raw" in rd:
         st.write(rd["raw"])
     else:
@@ -859,7 +897,7 @@ if st.session_state["reading"] is not None:
             for c in caution:
                 st.markdown(f"- {c}")
 
-    # 下载报告（都要）
+    # 下载报告（TXT + JSON）
     st.divider()
     st.markdown("### 📥 下载报告")
     json_bytes = json.dumps(rd, ensure_ascii=False, indent=2).encode("utf-8")
@@ -867,15 +905,14 @@ if st.session_state["reading"] is not None:
     st.download_button("下载 JSON（结构化）", data=json_bytes, file_name="tarot_reading.json", mime="application/json")
     st.download_button("下载 TXT（可读版）", data=txt_bytes, file_name="tarot_reading.txt", mime="text/plain")
 
-    # ✅ “升级为深度解读”按钮（都要）
-    # 只有当前结果非深度，并且用户有深度次数时才显示
+    # 升级按钮：只有当前结果是免费版且有深度次数时显示
     if (not is_deep) and (get_deep_credits(uid) > 0):
         st.divider()
         st.markdown("### 💎 升级本次为深度解读（不重抽牌）")
-        st.caption("将使用同一组牌与同一问题，生成更具体的行动步骤 / 观察信号 / 7天计划。")
+        st.caption("使用同一组牌与同一问题，生成更具体的行动步骤 / 观察信号 / 7天计划。")
         if st.button("升级为深度解读（消耗 1 次深度）"):
             if not consume_deep_credit(uid, 1):
-                st.error("深度次数不足，请先兑换激活码。")
+                st.error("深度次数不足，请先支付。")
             else:
                 with st.spinner("正在升级为深度解读..."):
                     try:
@@ -901,16 +938,14 @@ if st.session_state["reading"] is not None:
                 st.success("已升级为深度解读 ✅")
                 st.rerun()
 
-    # 没有深度次数时的转化提示
+    # 没深度次数时的转化提示
     if (not is_deep) and (get_deep_credits(uid) <= 0):
         st.divider()
         st.markdown("### 🌙 想要更具体的深度解读？")
-        st.write("兑换一次性激活码即可获得 **深度次数 +1**，并可直接升级本次结果（不重抽牌）。")
+        st.write("点击上方「立即支付 ¥9.9」完成支付后，系统会自动发放 **深度次数 +1**，并可直接升级本次结果（不重抽牌）。")
         show_paywall()
 
-# =========================
-# 11) 历史（会话内）
-# =========================
+# 历史（会话内）
 st.divider()
 st.subheader("📜 抽牌记录（本次打开页面期间）")
 c1, c2 = st.columns([1, 2])
@@ -919,7 +954,7 @@ with c1:
         st.session_state["history"] = []
         st.rerun()
 with c2:
-    st.caption("提示：记录仅在当前会话中显示；计费/限免/次数是写入SQLite的。")
+    st.caption("提示：记录仅在当前会话中显示；计费/限免/次数写入SQLite。")
 
 if st.session_state["history"]:
     for idx, h in enumerate(st.session_state["history"][:8], start=1):
